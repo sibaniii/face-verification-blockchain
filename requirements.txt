@@ -1,0 +1,5 @@
+face_recognition
+pytest
+requests
+python-dotenv
+beautifulsoup4
