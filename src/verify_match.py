@@ -1,32 +1,23 @@
 """
 Step 3 of the pipeline: independent face-match verification.
 
-ARCHITECTURE NOTE (important distinction):
-    Step 2 (search_stage.py) performs DISCOVERY -- a web/visual search
-    engine says "this URL looks visually similar." That is not proof
-    of identity.
-
-    This module performs VERIFICATION -- it independently downloads
-    the images actually found on that candidate page and compares
-    their face embeddings against the query image's own embedding,
-    using the same face_recognition/dlib approach as Step 1. Only this
-    module's result may be described as a "face match." A page ranked
-    highly by the search engine (e.g. an Instagram result) is treated
-    exactly the same as any other candidate: it must pass this
-    independent check, or it is reported as NO MATCH.
+ARCHITECTURE NOTE:
+    Step 2 performs DISCOVERY using a genuine visual web search.
+    Step 3 independently verifies the discovered candidate.
 
 Pipeline:
     query image
-        -> process_face() [reused from face_stage.py, Step 1]
+        -> process_face() from Step 1
         -> query face encoding
-    candidate_url (read from data/output/search_result.json)
-        -> fetch webpage (requests)
-        -> extract image URLs (BeautifulSoup)
-        -> download each image
-        -> detect ALL faces in each image (0, 1, or many)
-        -> compare every detected face against the query encoding
-        -> keep the smallest distance seen across all images
-        -> match_found = (best distance <= FACE_DISTANCE_THRESHOLD)
+    candidate_url from Step 2
+        -> fetch webpage
+        -> extract images from normal HTML
+        -> render webpage with Playwright for JavaScript/lazy-loaded images
+        -> download candidate images
+        -> detect ALL faces
+        -> compare faces against query encoding
+        -> keep smallest distance
+        -> determine match
 
 No raw face embeddings, and no API keys, are ever printed or saved.
 """
@@ -41,41 +32,62 @@ from urllib.parse import urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
+from playwright.sync_api import sync_playwright
 import face_recognition
 
 from src.face_stage import process_face, FaceStageError
 
-# A face_recognition euclidean distance below this is considered a match.
-# 0.6 is the conservative default commonly used with this library.
-FACE_DISTANCE_THRESHOLD = 0.6
 
-# Don't try to verify against an unbounded number of images on one page.
-# Deliberately generous: it's far better to extract 20-50 candidates and
-# let face detection eliminate irrelevant ones than to risk a tight
-# filter accidentally excluding the real photo (see extract_image_urls).
+# A face_recognition euclidean distance below this is considered a match.
+# 0.6 is the standard threshold used by this project.
+FACE_DISTANCE_THRESHOLD = 0.45
+
+
+# Don't verify against an unbounded number of images on one page.
 MAX_CANDIDATE_IMAGES = 30
 
-# Matches url(...) inside a CSS background-image declaration, whether it
-# appears in an inline style="" attribute or inside a <style> block.
-BACKGROUND_IMAGE_PATTERN = re.compile(r'url\(\s*[\'"]?([^\'")]+)[\'"]?\s*\)', re.IGNORECASE)
 
-# Light heuristic fallback: image-looking URLs embedded in <script>
-# blocks (e.g. a carousel's JSON config or page data). Not a substitute
-# for the structural parsing above -- just an extra net.
+# Matches url(...) inside CSS background-image declarations.
+BACKGROUND_IMAGE_PATTERN = re.compile(
+    r'url\(\s*[\'"]?([^\'")]+)[\'"]?\s*\)',
+    re.IGNORECASE,
+)
+
+
+# Image-looking URLs embedded inside script blocks.
 SCRIPT_IMAGE_URL_PATTERN = re.compile(
     r'https?://[^\s\'"<>]+?\.(?:jpg|jpeg|png|webp|gif)(?:\?[^\s\'"<>]*)?',
     re.IGNORECASE,
 )
 
-# Don't download unbounded content for a single image.
-MAX_IMAGE_DOWNLOAD_BYTES = 5 * 1024 * 1024  # 5 MB
+
+# Don't download unbounded content for one image.
+MAX_IMAGE_DOWNLOAD_BYTES = 5 * 1024 * 1024
+
 REQUEST_TIMEOUT_SECONDS = 15
 
-REQUEST_HEADERS = {"User-Agent": "Mozilla/5.0 (hackathon-face-verify-bot)"}
+REQUEST_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (hackathon-face-verify-bot)"
+}
 
-DEFAULT_SEARCH_RESULT_PATH = os.path.join("data", "output", "search_result.json")
-DEFAULT_VERIFICATION_OUTPUT_PATH = os.path.join("data", "output", "verification_result.json")
-DEFAULT_VERIFICATION_IMAGES_DIR = os.path.join("data", "output", "verification_images")
+
+DEFAULT_SEARCH_RESULT_PATH = os.path.join(
+    "data",
+    "output",
+    "search_result.json",
+)
+
+DEFAULT_VERIFICATION_OUTPUT_PATH = os.path.join(
+    "data",
+    "output",
+    "verification_result.json",
+)
+
+DEFAULT_VERIFICATION_IMAGES_DIR = os.path.join(
+    "data",
+    "output",
+    "verification_images",
+)
 
 
 class VerifyMatchError(Exception):
@@ -83,15 +95,15 @@ class VerifyMatchError(Exception):
 
 
 class SearchResultMissingError(VerifyMatchError):
-    """Raised when data/output/search_result.json is missing or unreadable."""
+    """Raised when search_result.json is missing or unreadable."""
 
 
 class CandidateMissingError(VerifyMatchError):
-    """Raised when search_result.json has no usable selected_candidate.url."""
+    """Raised when no usable candidate URL exists."""
 
 
 class WebpageFetchError(VerifyMatchError):
-    """Raised when the candidate webpage itself cannot be fetched."""
+    """Raised when the candidate webpage cannot be fetched."""
 
 
 # --------------------------------------------------------------------------
@@ -99,21 +111,34 @@ class WebpageFetchError(VerifyMatchError):
 # --------------------------------------------------------------------------
 
 def load_search_result(path=DEFAULT_SEARCH_RESULT_PATH):
-    """Read the candidate URL that Step 2 discovered. Never invented,
-    never asked for interactively -- it must come from search_stage's
-    saved output."""
+    """
+    Read the candidate URL discovered by Step 2.
+
+    The URL must come from search_stage's saved output.
+    It is never invented or hardcoded.
+    """
+
     if not os.path.isfile(path):
         raise SearchResultMissingError(
-            f"{path} not found. Run Step 2 (python -m src.search_stage <image>) first."
+            f"{path} not found. "
+            "Run Step 2 first."
         )
 
     try:
         with open(path, encoding="utf-8") as f:
             data = json.load(f)
-    except (OSError, json.JSONDecodeError) as exc:
-        raise SearchResultMissingError(f"Could not read {path}: {exc}") from exc
 
-    candidate = data.get("selected_candidate") if isinstance(data, dict) else None
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SearchResultMissingError(
+            f"Could not read {path}: {exc}"
+        ) from exc
+
+    candidate = (
+        data.get("selected_candidate")
+        if isinstance(data, dict)
+        else None
+    )
+
     if not isinstance(candidate, dict) or not candidate.get("url"):
         raise CandidateMissingError(
             f"{path} does not contain a selected_candidate with a url. "
@@ -124,153 +149,441 @@ def load_search_result(path=DEFAULT_SEARCH_RESULT_PATH):
 
 
 # --------------------------------------------------------------------------
-# Webpage fetching and image-URL extraction
+# Webpage fetching
 # --------------------------------------------------------------------------
 
 def fetch_webpage(url, timeout=REQUEST_TIMEOUT_SECONDS):
     try:
-        response = requests.get(url, timeout=timeout, headers=REQUEST_HEADERS)
+        response = requests.get(
+            url,
+            timeout=timeout,
+            headers=REQUEST_HEADERS,
+        )
+
     except requests.exceptions.RequestException as exc:
         raise WebpageFetchError(
-            f"Could not fetch candidate webpage ({type(exc).__name__})."
+            f"Could not fetch candidate webpage "
+            f"({type(exc).__name__})."
         ) from exc
 
     if response.status_code != 200:
         raise WebpageFetchError(
-            f"Candidate webpage returned HTTP {response.status_code}."
+            f"Candidate webpage returned HTTP "
+            f"{response.status_code}."
         )
 
     return response.text
 
 
+# --------------------------------------------------------------------------
+# Static image extraction
+# --------------------------------------------------------------------------
+
 def _parse_srcset(value):
-    """Split a srcset/data-srcset attribute ('url1 1x, url2 2x, ...')
-    into its individual candidate URLs."""
+    """
+    Split a srcset/data-srcset attribute into individual URLs.
+    """
+
     urls = []
+
     if not value:
         return urls
+
     for part in value.split(","):
         part = part.strip()
+
         if not part:
             continue
+
         tokens = part.split()
+
         if tokens:
             urls.append(tokens[0])
+
     return urls
 
 
-def extract_image_urls(html, base_url, max_images=MAX_CANDIDATE_IMAGES):
+def extract_image_urls(
+    html,
+    base_url,
+    max_images=MAX_CANDIDATE_IMAGES,
+):
     """
-    Pull candidate image URLs out of a webpage, covering the range of
-    ways modern sites (lazy-loading libraries, carousels, WordPress
-    page builders) represent images -- not just plain <img src>:
+    Extract image URLs from the normal HTML response.
 
-        - og:image / twitter:image meta tags
-        - <img src>
-        - common lazy-load attributes: data-src, data-lazy-src,
-          data-original
-        - srcset / data-srcset on <img> and <source> (all candidate
-          URLs in the set, not just the first)
-        - <picture><source srcset=...></picture>
-        - CSS background-image: url(...) in inline style="" attributes
-          and in <style> blocks
-        - common page-builder background-image data attributes:
-          data-bg, data-background, data-background-image
-        - a light fallback sweep of image-looking URLs (.jpg/.png/etc.)
-          inside <script> blocks, for content loaded from embedded
-          JSON/config rather than markup
-
-    Design choice: filtering here is intentionally light. We reject
-    non-http(s) schemes (data:, javascript:, file:) and .svg files
-    (a UI icon/logo format that is essentially never a person's
-    photo), but we do NOT filter by filename patterns like "logo" or
-    "icon" -- a real photo can have a generic filename, and it is far
-    safer to over-collect candidates and let face detection eliminate
-    irrelevant ones than to risk silently excluding the real photo.
-
-    Resolves relative URLs against base_url and deduplicates while
-    preserving order.
-
-    IMPORTANT LIMITATION: this only sees what a plain HTTP GET
-    receives. If a page injects its images via client-side JavaScript
-    *after* the initial page load (a genuine single-page-app/AJAX
-    carousel, as opposed to a lazy-load library that still ships real
-    <img>/data-* attributes in the server-rendered HTML), those images
-    are not present in `html` at all and cannot be found by any static
-    parser, including this one -- see known_limitations.md.
+    Handles:
+        - og:image
+        - twitter:image
+        - img src
+        - lazy-loading attributes
+        - srcset
+        - picture/source
+        - CSS background images
+        - page-builder background attributes
+        - image URLs inside script blocks
     """
+
     soup = BeautifulSoup(html, "html.parser")
+
     found = []
 
     def add(raw_url):
         if not raw_url:
             return
+
         raw_url = raw_url.strip()
+
         if not raw_url:
             return
-        if raw_url.startswith(("data:", "javascript:", "file:")):
+
+        if raw_url.startswith(
+            ("data:", "javascript:", "file:")
+        ):
             return
+
         absolute = urljoin(base_url, raw_url)
+
         parsed = urlparse(absolute)
+
         if parsed.scheme not in ("http", "https"):
             return
+
         if parsed.path.lower().endswith(".svg"):
             return
+
         found.append(absolute)
 
-    # 1. Open Graph / Twitter card meta images.
-    og_image = soup.find("meta", property="og:image")
+    # 1. Open Graph image.
+    og_image = soup.find(
+        "meta",
+        property="og:image",
+    )
+
     if og_image:
         add(og_image.get("content"))
 
-    twitter_image = soup.find("meta", attrs={"name": "twitter:image"})
+    # 2. Twitter card image.
+    twitter_image = soup.find(
+        "meta",
+        attrs={"name": "twitter:image"},
+    )
+
     if twitter_image:
         add(twitter_image.get("content"))
 
-    # 2. <img> tags: normal src, common lazy-load attributes, srcset.
+    # 3. <img> tags.
     for img in soup.find_all("img"):
+
         add(img.get("src"))
         add(img.get("data-src"))
         add(img.get("data-lazy-src"))
         add(img.get("data-original"))
-        for u in _parse_srcset(img.get("srcset")):
-            add(u)
-        for u in _parse_srcset(img.get("data-srcset")):
-            add(u)
 
-    # 3. <picture><source srcset=...></picture> (and standalone <source>).
+        for url in _parse_srcset(
+            img.get("srcset")
+        ):
+            add(url)
+
+        for url in _parse_srcset(
+            img.get("data-srcset")
+        ):
+            add(url)
+
+    # 4. <source> tags.
     for source in soup.find_all("source"):
-        for u in _parse_srcset(source.get("srcset")):
-            add(u)
-        for u in _parse_srcset(source.get("data-srcset")):
-            add(u)
 
-    # 4. CSS background-image: inline style="" attributes anywhere...
+        for url in _parse_srcset(
+            source.get("srcset")
+        ):
+            add(url)
+
+        for url in _parse_srcset(
+            source.get("data-srcset")
+        ):
+            add(url)
+
+    # 5. Inline CSS background images.
     for tag in soup.find_all(style=True):
-        for match in BACKGROUND_IMAGE_PATTERN.findall(tag["style"]):
-            add(match)
-    # ...and embedded <style> blocks.
-    for style_tag in soup.find_all("style"):
-        for match in BACKGROUND_IMAGE_PATTERN.findall(style_tag.get_text()):
+
+        for match in BACKGROUND_IMAGE_PATTERN.findall(
+            tag["style"]
+        ):
             add(match)
 
-    # 5. Common page-builder / lazy-load background-image data attributes.
-    for attr in ("data-bg", "data-background", "data-background-image"):
-        for tag in soup.find_all(attrs={attr: True}):
+    # 6. <style> blocks.
+    for style_tag in soup.find_all("style"):
+
+        for match in BACKGROUND_IMAGE_PATTERN.findall(
+            style_tag.get_text()
+        ):
+            add(match)
+
+    # 7. Common background-image attributes.
+    for attr in (
+        "data-bg",
+        "data-background",
+        "data-background-image",
+    ):
+
+        for tag in soup.find_all(
+            attrs={attr: True}
+        ):
             add(tag.get(attr))
 
-    # 6. Fallback sweep: image-looking URLs inside <script> blocks.
+    # 8. Image URLs embedded inside scripts.
     for script_tag in soup.find_all("script"):
-        script_text = script_tag.get_text() or ""
-        for match in SCRIPT_IMAGE_URL_PATTERN.findall(script_text):
+
+        script_text = (
+            script_tag.get_text() or ""
+        )
+
+        for match in SCRIPT_IMAGE_URL_PATTERN.findall(
+            script_text
+        ):
             add(match)
 
+    # Deduplicate while preserving order.
     deduped = []
     seen = set()
+
     for url in found:
+
         if url not in seen:
             seen.add(url)
             deduped.append(url)
+
+    return deduped[:max_images]
+
+
+# --------------------------------------------------------------------------
+# Browser-rendered image extraction
+# --------------------------------------------------------------------------
+
+def extract_rendered_image_urls(
+    url,
+    max_images=MAX_CANDIDATE_IMAGES,
+):
+    """
+    Render the candidate webpage in Chromium and collect images that may
+    only appear after JavaScript or lazy loading executes.
+
+    IMPORTANT:
+        The URL always comes from Step 2.
+        No website, person, platform, or URL is hardcoded.
+    """
+
+    found = []
+
+    try:
+
+        with sync_playwright() as p:
+
+            browser = p.chromium.launch(
+                headless=True
+            )
+
+            page = browser.new_page(
+                user_agent=REQUEST_HEADERS["User-Agent"]
+            )
+
+            try:
+
+                page.goto(
+                    url,
+                    wait_until="domcontentloaded",
+                    timeout=30000,
+                )
+
+            except Exception:
+                # Some websites continue loading indefinitely.
+                # The already-rendered page can still contain useful images.
+                pass
+
+            # Allow JavaScript and lazy loading to execute.
+            page.wait_for_timeout(3000)
+
+            # Scroll through the page to trigger lazy-loaded images.
+            for _ in range(5):
+
+                page.mouse.wheel(
+                    0,
+                    1200,
+                )
+
+                page.wait_for_timeout(500)
+
+            # ----------------------------------------------------------
+            # Collect <img> URLs.
+            # ----------------------------------------------------------
+
+            image_urls = page.locator(
+                "img"
+            ).evaluate_all(
+                """
+                imgs => imgs.flatMap(img => {
+                    const values = [];
+
+                    if (img.currentSrc) {
+                        values.push(img.currentSrc);
+                    }
+
+                    if (img.src) {
+                        values.push(img.src);
+                    }
+
+                    for (const attr of [
+                        "data-src",
+                        "data-lazy-src",
+                        "data-original",
+                        "data-image",
+                        "data-url"
+                    ]) {
+                        const value = img.getAttribute(attr);
+
+                        if (value) {
+                            values.push(value);
+                        }
+                    }
+
+                    for (const attr of [
+                        "srcset",
+                        "data-srcset"
+                    ]) {
+                        const value = img.getAttribute(attr);
+
+                        if (value) {
+
+                            for (
+                                const part of value.split(",")
+                            ) {
+
+                                const candidate =
+                                    part.trim()
+                                        .split(/\\s+/)[0];
+
+                                if (candidate) {
+                                    values.push(candidate);
+                                }
+                            }
+                        }
+                    }
+
+                    return values;
+                })
+                """
+            )
+
+            found.extend(image_urls)
+
+            # ----------------------------------------------------------
+            # Collect rendered CSS background images.
+            # ----------------------------------------------------------
+
+            background_urls = page.locator(
+                "*"
+            ).evaluate_all(
+                """
+                elements => elements.flatMap(el => {
+
+                    const value =
+                        getComputedStyle(el)
+                        .getPropertyValue(
+                            "background-image"
+                        );
+
+                    if (
+                        !value ||
+                        value === "none"
+                    ) {
+                        return [];
+                    }
+
+                    const matches = [];
+
+                    const regex =
+                        /url\\(["']?([^"')]+)["']?\\)/g;
+
+                    let match;
+
+                    while (
+                        (match = regex.exec(value)) !== null
+                    ) {
+                        matches.push(match[1]);
+                    }
+
+                    return matches;
+                })
+                """
+            )
+
+            found.extend(background_urls)
+
+            # ----------------------------------------------------------
+            # Collect image resources loaded by the browser.
+            # ----------------------------------------------------------
+
+            resource_urls = page.evaluate(
+                """
+                () => performance
+                    .getEntriesByType("resource")
+                    .map(entry => entry.name)
+                    .filter(url =>
+                        /\\.(jpg|jpeg|png|webp|gif)(\\?|$)/i
+                            .test(url)
+                    )
+                """
+            )
+
+            found.extend(resource_urls)
+
+            browser.close()
+
+    except Exception as exc:
+
+        print(
+            "Browser image extraction skipped: "
+            f"{type(exc).__name__}"
+        )
+
+    # Resolve relative URLs and deduplicate.
+    deduped = []
+    seen = set()
+
+    for raw_url in found:
+
+        if not raw_url:
+            continue
+
+        raw_url = str(raw_url).strip()
+
+        if not raw_url:
+            continue
+
+        if raw_url.startswith(
+            ("data:", "javascript:", "file:")
+        ):
+            continue
+
+        absolute = urljoin(
+            url,
+            raw_url,
+        )
+
+        parsed = urlparse(absolute)
+
+        if parsed.scheme not in (
+            "http",
+            "https",
+        ):
+            continue
+
+        if parsed.path.lower().endswith(".svg"):
+            continue
+
+        if absolute not in seen:
+
+            seen.add(absolute)
+            deduped.append(absolute)
 
     return deduped[:max_images]
 
@@ -280,15 +593,25 @@ def extract_image_urls(html, base_url, max_images=MAX_CANDIDATE_IMAGES):
 # --------------------------------------------------------------------------
 
 def download_image_bytes(
-    url, timeout=REQUEST_TIMEOUT_SECONDS, max_bytes=MAX_IMAGE_DOWNLOAD_BYTES
+    url,
+    timeout=REQUEST_TIMEOUT_SECONDS,
+    max_bytes=MAX_IMAGE_DOWNLOAD_BYTES,
 ):
-    """Download image bytes, or return None on any failure (network
-    error, non-200 status, or oversized response). Never raises --
-    callers treat None as 'skip this candidate'."""
+    """
+    Download image bytes.
+
+    Returns None if the download fails.
+    """
+
     try:
+
         response = requests.get(
-            url, timeout=timeout, headers=REQUEST_HEADERS, stream=True
+            url,
+            timeout=timeout,
+            headers=REQUEST_HEADERS,
+            stream=True,
         )
+
     except requests.exceptions.RequestException:
         return None
 
@@ -296,117 +619,229 @@ def download_image_bytes(
         return None
 
     content = bytearray()
+
     try:
-        for chunk in response.iter_content(chunk_size=8192):
+
+        for chunk in response.iter_content(
+            chunk_size=8192
+        ):
+
             if not chunk:
                 continue
+
             content.extend(chunk)
+
             if len(content) > max_bytes:
                 return None
+
     except requests.exceptions.RequestException:
         return None
 
     return bytes(content)
 
 
-def save_candidate_image(image_bytes, index, output_dir=DEFAULT_VERIFICATION_IMAGES_DIR):
-    """Save a downloaded candidate image under a safe, generated
-    filename (never a filename taken directly from the URL)."""
-    os.makedirs(output_dir, exist_ok=True)
-    path = os.path.join(output_dir, f"candidate_{index:03d}.jpg")
+def save_candidate_image(
+    image_bytes,
+    index,
+    output_dir=DEFAULT_VERIFICATION_IMAGES_DIR,
+):
+    """
+    Save a downloaded candidate image.
+    """
+
+    os.makedirs(
+        output_dir,
+        exist_ok=True,
+    )
+
+    path = os.path.join(
+        output_dir,
+        f"candidate_{index:03d}.jpg",
+    )
+
     with open(path, "wb") as f:
         f.write(image_bytes)
+
     return path
 
 
 # --------------------------------------------------------------------------
-# Face detection/comparison on candidate images
-# (uses the same face_recognition/dlib approach as face_stage.py, but
-#  without Step 1's "exactly one face" constraint, since a webpage
-#  photo may legitimately contain zero, one, or many people)
+# Face detection and comparison
 # --------------------------------------------------------------------------
 
 def encode_all_faces(image_array):
-    """Detect every face in an already-decoded image array and return
-    a list of (location, encoding) pairs. Returns [] if no faces."""
-    locations = face_recognition.face_locations(image_array)
+    """
+    Detect every face in an image.
+
+    Returns:
+        [(location, encoding), ...]
+    """
+
+    locations = face_recognition.face_locations(
+        image_array
+    )
+
     if not locations:
         return []
-    encodings = face_recognition.face_encodings(image_array, known_face_locations=locations)
-    return list(zip(locations, encodings))
+
+    encodings = face_recognition.face_encodings(
+        image_array,
+        known_face_locations=locations,
+    )
+
+    return list(
+        zip(
+            locations,
+            encodings,
+        )
+    )
 
 
-def best_face_distance(query_encoding, candidate_encodings):
-    """Given the query encoding and a list of encodings found in one
-    candidate image, return the smallest distance (a group photo's
-    closest face), or None if candidate_encodings is empty."""
+def best_face_distance(
+    query_encoding,
+    candidate_encodings,
+):
+    """
+    Return the smallest face distance in a candidate image.
+    """
+
     if not candidate_encodings:
         return None
-    distances = face_recognition.face_distance(candidate_encodings, query_encoding)
-    return float(min(distances))
+
+    distances = face_recognition.face_distance(
+        candidate_encodings,
+        query_encoding,
+    )
+
+    return float(
+        min(distances)
+    )
 
 
 # --------------------------------------------------------------------------
 # Terminal output
 # --------------------------------------------------------------------------
 
-def _print_banner(query_image_path, candidate_url):
+def _print_banner(
+    query_image_path,
+    candidate_url,
+):
     print("=" * 40)
     print("STEP 3: FACE MATCH VERIFICATION")
     print("=" * 40)
     print()
+
     print("Query image:")
     print(query_image_path)
     print()
+
     print("Candidate source:")
     print(candidate_url)
     print()
+
     print("Fetching candidate webpage...")
     print()
 
 
 def _print_debug_urls(image_urls):
+
     print("Extracted image URLs:")
-    for i, url in enumerate(image_urls, start=1):
-        print(f"{i}. {url}")
+
+    for i, url in enumerate(
+        image_urls,
+        start=1,
+    ):
+        print(
+            f"{i}. {url}"
+        )
+
     print()
 
 
-def _print_image_result(index, total, url, face_count, distance, threshold, outcome):
-    print(f"[{index}/{total}] {url}")
-    print(f"Faces detected: {face_count}")
+def _print_image_result(
+    index,
+    total,
+    url,
+    face_count,
+    distance,
+    threshold,
+    outcome,
+):
+    print(
+        f"[{index}/{total}] {url}"
+    )
+
+    print(
+        f"Faces detected: {face_count}"
+    )
+
     if distance is not None:
-        print(f"Best face distance: {distance:.2f}")
-    print(f"Result: {outcome}")
+
+        print(
+            f"Best face distance: "
+            f"{distance:.2f}"
+        )
+
+    print(
+        f"Result: {outcome}"
+    )
+
     print()
 
 
-def _print_final_result(result, threshold):
+def _print_final_result(
+    result,
+    threshold,
+):
     print("=" * 40)
     print("VERIFICATION RESULT")
     print("=" * 40)
     print()
+
     print("Candidate source:")
     print(result["candidate_url"])
     print()
 
     if result["best_match"] is not None:
+
         print("Matching image:")
-        print(result["best_match"]["image_url"])
-        print()
-        print("Face distance:")
-        print(f"{result['best_match']['face_distance']:.2f}")
-        print()
-        print("Threshold:")
-        print(f"{threshold:.2f}")
-        print()
-    else:
-        print("No face was detected in any candidate image.")
+        print(
+            result["best_match"]["image_url"]
+        )
         print()
 
-    print(f"FACE MATCH: {'YES' if result['match_found'] else 'NO'}")
+        print("Face distance:")
+        print(
+            f"{result['best_match']['face_distance']:.2f}"
+        )
+        print()
+
+        print("Threshold:")
+        print(
+            f"{threshold:.2f}"
+        )
+        print()
+
+    else:
+
+        print(
+            "No face was detected in any "
+            "candidate image."
+        )
+        print()
+
+    print(
+        f"FACE MATCH: "
+        f"{'YES' if result['match_found'] else 'NO'}"
+    )
+
     print()
-    print(f"Candidate discovered: {'VERIFIED' if result['match_found'] else 'NOT VERIFIED'}")
+
+    print(
+        "Candidate discovered: "
+        f"{'VERIFIED' if result['match_found'] else 'NOT VERIFIED'}"
+    )
+
     print("=" * 40)
 
 
@@ -414,17 +849,37 @@ def _print_final_result(result, threshold):
 # Persistence
 # --------------------------------------------------------------------------
 
-def save_verification_result(result, output_path=DEFAULT_VERIFICATION_OUTPUT_PATH):
-    output_dir = os.path.dirname(output_path)
+def save_verification_result(
+    result,
+    output_path=DEFAULT_VERIFICATION_OUTPUT_PATH,
+):
+    output_dir = os.path.dirname(
+        output_path
+    )
+
     if output_dir:
-        os.makedirs(output_dir, exist_ok=True)
-    with open(output_path, "w", encoding="utf-8") as f:
-        json.dump(result, f, indent=2)
+        os.makedirs(
+            output_dir,
+            exist_ok=True,
+        )
+
+    with open(
+        output_path,
+        "w",
+        encoding="utf-8",
+    ) as f:
+
+        json.dump(
+            result,
+            f,
+            indent=2,
+        )
+
     return output_path
 
 
 # --------------------------------------------------------------------------
-# Orchestration
+# Main verification pipeline
 # --------------------------------------------------------------------------
 
 def verify_match(
@@ -439,128 +894,359 @@ def verify_match(
     debug=False,
 ):
     """
-    Runs Step 3 end to end. process_face_fn / fetch_webpage_fn /
-    download_image_fn are injectable purely so tests can run fully
-    offline with mocked network and face-recognition calls.
+    Runs Step 3 end to end.
 
-    debug=True prints the full extracted image-URL list before
-    downloading anything, to help diagnose extraction on a new page.
+    The candidate URL always comes from Step 2.
 
-    Returns the saved verification result dict.
+    Static HTML extraction and browser-rendered extraction are combined
+    before face verification.
     """
-    # 1. Query face (reuses Step 1's exactly-one-face logic as-is).
-    query_result = process_face_fn(query_image_path)
-    query_encoding = query_result["face_encoding"]
 
-    # 2. Candidate URL (must come from Step 2's saved output).
-    candidate_url = load_search_result(search_result_path)
+    # ----------------------------------------------------------
+    # 1. Query face from Step 1.
+    # ----------------------------------------------------------
 
-    _print_banner(query_image_path, candidate_url)
+    query_result = process_face_fn(
+        query_image_path
+    )
 
-    # 3-4. Fetch page, extract image URLs.
-    html = fetch_webpage_fn(candidate_url)
-    image_urls = extract_image_urls(html, candidate_url)
+    query_encoding = query_result[
+        "face_encoding"
+    ]
 
-    print(f"Images discovered: {len(image_urls)}")
-    print(f"Images selected for verification: {len(image_urls)}")
+    # ----------------------------------------------------------
+    # 2. Candidate URL from Step 2.
+    # ----------------------------------------------------------
+
+    candidate_url = load_search_result(
+        search_result_path
+    )
+
+    _print_banner(
+        query_image_path,
+        candidate_url,
+    )
+
+    # ----------------------------------------------------------
+    # 3. Fetch normal HTML.
+    # ----------------------------------------------------------
+
+    html = fetch_webpage_fn(
+        candidate_url
+    )
+
+    # ----------------------------------------------------------
+    # 4. Extract images from normal HTML.
+    # ----------------------------------------------------------
+
+    static_image_urls = extract_image_urls(
+        html,
+        candidate_url,
+    )
+
+    # ----------------------------------------------------------
+    # 5. Render the same discovered URL in Chromium.
+    # ----------------------------------------------------------
+
+    rendered_image_urls = (
+        extract_rendered_image_urls(
+            candidate_url
+        )
+    )
+
+    # ----------------------------------------------------------
+    # 6. Combine both image sources.
+    # ----------------------------------------------------------
+
+    image_urls = []
+
+    seen_image_urls = set()
+
+    for image_url in (
+        static_image_urls +
+        rendered_image_urls
+    ):
+
+        if image_url not in seen_image_urls:
+
+            seen_image_urls.add(
+                image_url
+            )
+
+            image_urls.append(
+                image_url
+            )
+
+    image_urls = image_urls[
+        :MAX_CANDIDATE_IMAGES
+    ]
+
+    print(
+        f"Images discovered: "
+        f"{len(image_urls)}"
+    )
+
+    print(
+        "Images selected for verification: "
+        f"{len(image_urls)}"
+    )
+
     print()
 
     if debug:
-        _print_debug_urls(image_urls)
+        _print_debug_urls(
+            image_urls
+        )
 
-    print("Analyzing candidate images...")
+    print(
+        "Analyzing candidate images..."
+    )
+
     print()
 
-    best = None  # {"image_url":..., "local_path":..., "face_distance":...}
+    # ----------------------------------------------------------
+    # 7. Download, detect and compare.
+    # ----------------------------------------------------------
+
+    best = None
+
     analyzed_count = 0
+
     total = len(image_urls)
 
-    # 5-8. Download, detect, compare -- one image at a time, tolerating
-    # any single image failing without aborting the whole verification.
-    for i, image_url in enumerate(image_urls, start=1):
-        image_bytes = download_image_fn(image_url)
+    for i, image_url in enumerate(
+        image_urls,
+        start=1,
+    ):
+
+        image_bytes = download_image_fn(
+            image_url
+        )
+
         if image_bytes is None:
-            _print_image_result(i, total, image_url, 0, None, threshold, "SKIPPED (download failed)")
+
+            _print_image_result(
+                i,
+                total,
+                image_url,
+                0,
+                None,
+                threshold,
+                "SKIPPED (download failed)",
+            )
+
             continue
 
         try:
-            image_array = face_recognition.load_image_file(io.BytesIO(image_bytes))
+
+            image_array = (
+                face_recognition.load_image_file(
+                    io.BytesIO(image_bytes)
+                )
+            )
+
         except Exception:
-            _print_image_result(i, total, image_url, 0, None, threshold, "SKIPPED (invalid image)")
+
+            _print_image_result(
+                i,
+                total,
+                image_url,
+                0,
+                None,
+                threshold,
+                "SKIPPED (invalid image)",
+            )
+
             continue
 
         analyzed_count += 1
-        faces = encode_all_faces(image_array)
+
+        faces = encode_all_faces(
+            image_array
+        )
+
         face_count = len(faces)
 
         if face_count == 0:
-            _print_image_result(i, total, image_url, 0, None, threshold, "NO FACE")
+
+            _print_image_result(
+                i,
+                total,
+                image_url,
+                0,
+                None,
+                threshold,
+                "NO FACE",
+            )
+
             continue
 
-        candidate_encodings = [encoding for _, encoding in faces]
-        distance = best_face_distance(query_encoding, candidate_encodings)
-        is_match = distance <= threshold
-        _print_image_result(
-            i, total, image_url, face_count, distance, threshold,
-            "MATCH" if is_match else "NO MATCH",
+        candidate_encodings = [
+            encoding
+            for _, encoding in faces
+        ]
+
+        distance = best_face_distance(
+            query_encoding,
+            candidate_encodings,
         )
 
-        if best is None or distance < best["face_distance"]:
-            saved_path = save_candidate_image(image_bytes, i, images_dir)
-            best = {"image_url": image_url, "local_path": saved_path, "face_distance": distance}
+        is_match = (
+            distance <= threshold
+        )
 
-    # 9. Best match + overall decision.
-    match_found = best is not None and best["face_distance"] <= threshold
+        _print_image_result(
+            i,
+            total,
+            image_url,
+            face_count,
+            distance,
+            threshold,
+            "MATCH"
+            if is_match
+            else "NO MATCH",
+        )
+
+        if (
+            best is None
+            or distance <
+            best["face_distance"]
+        ):
+
+            saved_path = (
+                save_candidate_image(
+                    image_bytes,
+                    i,
+                    images_dir,
+                )
+            )
+
+            best = {
+                "image_url": image_url,
+                "local_path": saved_path,
+                "face_distance": distance,
+            }
+
+    # ----------------------------------------------------------
+    # 8. Overall decision.
+    # ----------------------------------------------------------
+
+    match_found = (
+        best is not None
+        and best["face_distance"] <= threshold
+    )
 
     result = {
         "query_image": query_image_path,
+
         "candidate_url": candidate_url,
+
         "verification_completed": True,
+
         "match_found": match_found,
+
         "best_match": (
             {
                 "image_url": best["image_url"],
                 "local_image_path": best["local_path"],
-                "face_distance": round(best["face_distance"], 4),
+                "face_distance": round(
+                    best["face_distance"],
+                    4,
+                ),
                 "threshold": threshold,
             }
             if best is not None
             else None
         ),
-        "images_discovered": len(image_urls),
+
+        "images_discovered": len(
+            image_urls
+        ),
+
         "images_analyzed": analyzed_count,
-        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+
+        "timestamp_utc": datetime.now(
+            timezone.utc
+        ).isoformat(),
     }
 
-    # 10. Save.
-    save_verification_result(result, output_path)
-    _print_final_result(result, threshold)
+    # ----------------------------------------------------------
+    # 9. Save result.
+    # ----------------------------------------------------------
+
+    save_verification_result(
+        result,
+        output_path,
+    )
+
+    _print_final_result(
+        result,
+        threshold,
+    )
 
     return result
 
 
+# --------------------------------------------------------------------------
+# CLI
+# --------------------------------------------------------------------------
+
 def main(argv=None):
-    argv = sys.argv[1:] if argv is None else argv
+
+    argv = (
+        sys.argv[1:]
+        if argv is None
+        else argv
+    )
 
     debug = "--debug" in argv
-    positional = [a for a in argv if a != "--debug"]
+
+    positional = [
+        a
+        for a in argv
+        if a != "--debug"
+    ]
 
     if len(positional) != 1:
-        print("Usage: python -m src.verify_match <query_image_path> [--debug]")
+
+        print(
+            "Usage: "
+            "python -m src.verify_match "
+            "<query_image_path> [--debug]"
+        )
+
         return 2
 
     query_image_path = positional[0]
 
     try:
-        result = verify_match(query_image_path, debug=debug)
-    except (FaceStageError, VerifyMatchError) as exc:
+
+        result = verify_match(
+            query_image_path,
+            debug=debug,
+        )
+
+    except (
+        FaceStageError,
+        VerifyMatchError,
+    ) as exc:
+
         print("=" * 40)
-        print(f"ERROR: {exc}")
-        print("Status: FAILED")
+        print(
+            f"ERROR: {exc}"
+        )
+        print(
+            "Status: FAILED"
+        )
         print("=" * 40)
+
         return 1
 
-    return 0 if result["match_found"] else 1
+    return (
+        0
+        if result["match_found"]
+        else 1
+    )
 
 
 if __name__ == "__main__":

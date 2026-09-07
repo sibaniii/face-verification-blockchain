@@ -221,7 +221,6 @@ def _print_result(record, fingerprint_hash, evidence_path, fingerprint_path):
     print("Evidence record:")
     print(f"  Matched URL: {record['matched_url']}")
     print(f"  Matched image URL: {record['matched_image_url']}")
-    print(f"  Matched image SHA-256: {record['matched_image_sha256']}")
     print(f"  Face distance: {record['face_distance']}")
     print(f"  Threshold: {record['verification_threshold']}")
     print(f"  Verification status: {record['verification_status']}")
@@ -229,12 +228,27 @@ def _print_result(record, fingerprint_hash, evidence_path, fingerprint_path):
     print(f"  Search method: {record['search_method']}")
     print(f"  Timestamp (reused from Step 3): {record['timestamp_utc']}")
     print()
-    print(f"Evidence record saved to: {evidence_path}")
+
+    print("=" * 40)
+    print("SHA-256 FINGERPRINT")
+    print("=" * 40)
     print()
-    print("Fingerprint hash (SHA-256 of canonical evidence record):")
+
+    print("INPUT HASH (MATCHED IMAGE):")
+    print(record["matched_image_sha256"])
+    print()
+
+    print("OUTPUT HASH (EVIDENCE FINGERPRINT):")
     print(fingerprint_hash)
     print()
+
+    print("FINGERPRINT GENERATED: YES")
+    print()
+
+    print(f"Evidence record saved to: {evidence_path}")
     print(f"Fingerprint saved to: {fingerprint_path}")
+    print()
+
     print("Status: SUCCESS")
     print("=" * 40)
 

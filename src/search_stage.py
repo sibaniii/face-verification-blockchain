@@ -528,17 +528,23 @@ def search_for_match(
                 needs_fallback = True
 
     if needs_fallback:
-        search_engine, search_method, selected = run_fallback_menu(browser_open, prompt)
-        if selected is None:
-            print()
-            print("=" * 40)
-            print("No candidate selected. Exiting without a result.")
-            print("Status: FAILED")
-            print("=" * 40)
-            return None
-        candidates = [selected]
+        print()
+        print("=" * 40)
+        print("AUTOMATED SEARCH FAILED")
+        print("Browser fallback is disabled.")
+        print("No browser will be opened.")
+        print("Status: FAILED")
+        print("=" * 40)
+        return None
 
-    result = build_result(image_path, search_engine, search_method, selected, candidates)
+    result = build_result(
+        image_path,
+        search_engine,
+        search_method,
+        selected,
+        candidates
+    )
+
     save_result(result, output_path)
     _print_discovered_pending(result, output_path)
 
